@@ -1,35 +1,42 @@
 import {
-  Timestamp,
-  collection,
-  doc,
-  onSnapshot,
+  onDisconnect,
+  onValue,
+  ref,
+  remove,
   serverTimestamp,
-  setDoc,
-} from 'firebase/firestore'
+  set,
+  type DatabaseReference,
+} from 'firebase/database'
 
-import { db } from './firebase'
+import { hasRealtimeDatabaseConfig, realtimeDb } from './firebase'
 
 export const TEAM_COUNT = 12
-export const PRESENCE_HEARTBEAT_MS = 20_000
-export const PRESENCE_ACTIVE_WINDOW_MS = 60_000
 
 const DEVICE_ID_STORAGE_KEY = 'nazokai-device-id'
+const SESSION_ID_STORAGE_KEY = 'nazokai-session-id'
 const SELECTION_STORAGE_KEY = 'nazokai-selection'
-const PRESENCE_COLLECTION = 'presence'
+const CONNECTIONS_PATH = 'presence/connections'
 
 export type ControlRole = 'screen' | 'staff' | 'master'
 export type Selection =
   | { role: 'player'; teamNumber: number }
   | { role: ControlRole }
 
-type PresenceDoc = {
-  role?: string
+type PresenceRecord = {
+  connectedAt?: number | Record<string, string> | null
+  deviceId?: string
+  role?: string | null
   teamNumber?: number | null
-  updatedAt?: Timestamp | null
+  updatedAt?: number | Record<string, string> | null
 }
 
-function createDeviceId() {
-  return `device-${crypto.randomUUID()}`
+type PresenceBindingCallbacks = {
+  onConnectionChange?: (isConnected: boolean) => void
+  onError?: (message: string | null) => void
+}
+
+function createId(prefix: string) {
+  return `${prefix}-${crypto.randomUUID()}`
 }
 
 export function getDeviceId() {
@@ -38,13 +45,24 @@ export function getDeviceId() {
     return existingId
   }
 
-  const newId = createDeviceId()
+  const newId = createId('device')
   window.localStorage.setItem(DEVICE_ID_STORAGE_KEY, newId)
   return newId
 }
 
+export function getSessionId() {
+  const existingId = window.sessionStorage.getItem(SESSION_ID_STORAGE_KEY)
+  if (existingId) {
+    return existingId
+  }
+
+  const newId = createId('session')
+  window.sessionStorage.setItem(SESSION_ID_STORAGE_KEY, newId)
+  return newId
+}
+
 export function readStoredSelection(): Selection | null {
-  const raw = window.localStorage.getItem(SELECTION_STORAGE_KEY)
+  const raw = window.sessionStorage.getItem(SELECTION_STORAGE_KEY)
   if (!raw) {
     return null
   }
@@ -69,7 +87,7 @@ export function readStoredSelection(): Selection | null {
       return { role: parsed.role }
     }
   } catch {
-    window.localStorage.removeItem(SELECTION_STORAGE_KEY)
+    window.sessionStorage.removeItem(SELECTION_STORAGE_KEY)
   }
 
   return null
@@ -77,69 +95,136 @@ export function readStoredSelection(): Selection | null {
 
 export function storeSelection(selection: Selection | null) {
   if (!selection) {
-    window.localStorage.removeItem(SELECTION_STORAGE_KEY)
+    window.sessionStorage.removeItem(SELECTION_STORAGE_KEY)
     return
   }
 
-  window.localStorage.setItem(SELECTION_STORAGE_KEY, JSON.stringify(selection))
+  window.sessionStorage.setItem(SELECTION_STORAGE_KEY, JSON.stringify(selection))
 }
 
-export async function publishSelection(selection: Selection) {
-  const deviceId = getDeviceId()
-
-  await setDoc(
-    doc(db, PRESENCE_COLLECTION, deviceId),
-    {
-      deviceId,
-      role: selection.role,
-      teamNumber: selection.role === 'player' ? selection.teamNumber : null,
-      updatedAt: serverTimestamp(),
-    },
-    { merge: true },
-  )
-}
-
-export async function clearSelection() {
-  const deviceId = getDeviceId()
-
-  await setDoc(
-    doc(db, PRESENCE_COLLECTION, deviceId),
-    {
-      deviceId,
-      role: null,
-      teamNumber: null,
-      updatedAt: serverTimestamp(),
-    },
-    { merge: true },
-  )
-}
-
-function isPresenceActive(updatedAt: Timestamp | null | undefined) {
-  if (!updatedAt) {
-    return false
+function toErrorMessage(error: unknown) {
+  if (error instanceof Error) {
+    return error.message
   }
 
-  return Date.now() - updatedAt.toMillis() <= PRESENCE_ACTIVE_WINDOW_MS
+  return 'Failed to synchronize presence.'
+}
+
+function createPresenceRecord(selection: Selection) {
+  return {
+    deviceId: getDeviceId(),
+    sessionId: getSessionId(),
+    role: selection.role,
+    teamNumber: selection.role === 'player' ? selection.teamNumber : null,
+    connectedAt: serverTimestamp(),
+    updatedAt: serverTimestamp(),
+  }
+}
+
+export function bindSelectionPresence(
+  selection: Selection | null,
+  callbacks: PresenceBindingCallbacks = {},
+) {
+  if (!hasRealtimeDatabaseConfig || !realtimeDb) {
+    callbacks.onConnectionChange?.(false)
+    callbacks.onError?.('Realtime Database URL is not configured.')
+    return () => undefined
+  }
+
+  const connectedRef = ref(realtimeDb, '.info/connected')
+  const presenceRef = ref(realtimeDb, `${CONNECTIONS_PATH}/${getSessionId()}`)
+  let isDisposed = false
+
+  const unsubscribe = onValue(
+    connectedRef,
+    async (snapshot) => {
+      if (isDisposed) {
+        return
+      }
+
+      const isConnected = snapshot.val() === true
+      callbacks.onConnectionChange?.(isConnected)
+
+      if (!isConnected) {
+        return
+      }
+
+      try {
+        await onDisconnect(presenceRef).remove()
+
+        if (!selection) {
+          await remove(presenceRef)
+        } else {
+          await set(presenceRef, createPresenceRecord(selection))
+        }
+
+        callbacks.onError?.(null)
+      } catch (error) {
+        callbacks.onError?.(toErrorMessage(error))
+      }
+    },
+    (error) => {
+      callbacks.onError?.(toErrorMessage(error))
+    },
+  )
+
+  return () => {
+    isDisposed = true
+    unsubscribe()
+    callbacks.onConnectionChange?.(false)
+    void onDisconnect(presenceRef).cancel().catch(() => undefined)
+    void remove(presenceRef).catch(() => undefined)
+  }
 }
 
 export function subscribeToOccupiedTeams(
   onChange: (occupiedTeams: Set<number>) => void,
+  onError?: (message: string | null) => void,
 ) {
-  return onSnapshot(collection(db, PRESENCE_COLLECTION), (snapshot) => {
-    const occupiedTeams = new Set<number>()
+  if (!hasRealtimeDatabaseConfig || !realtimeDb) {
+    onChange(new Set())
+    onError?.('Realtime Database URL is not configured.')
+    return () => undefined
+  }
 
-    for (const documentSnapshot of snapshot.docs) {
-      const data = documentSnapshot.data() as PresenceDoc
+  const connectionsRef = ref(realtimeDb, CONNECTIONS_PATH)
 
-      if (
-        data.role === 'player' &&
-        typeof data.teamNumber === 'number' &&
-        isPresenceActive(data.updatedAt)
-      ) {
-        occupiedTeams.add(data.teamNumber)
+  return onValue(
+    connectionsRef,
+    (snapshot) => {
+      const occupiedTeams = new Set<number>()
+      const rawValue = snapshot.val() as Record<string, PresenceRecord> | null
+
+      if (rawValue) {
+        for (const record of Object.values(rawValue)) {
+          if (record.role === 'player' && typeof record.teamNumber === 'number') {
+            occupiedTeams.add(record.teamNumber)
+          }
+        }
       }
-    }
 
-    onChange(occupiedTeams)
-  })
+      onError?.(null)
+      onChange(occupiedTeams)
+    },
+    (error) => {
+      onError?.(toErrorMessage(error))
+    },
+  )
+}
+
+export function clearSelectionPresence() {
+  if (!hasRealtimeDatabaseConfig || !realtimeDb) {
+    return Promise.resolve()
+  }
+
+  const presenceRef = ref(realtimeDb, `${CONNECTIONS_PATH}/${getSessionId()}`)
+  return remove(presenceRef)
+}
+
+export function getSelectionPresenceRef(): DatabaseReference | null {
+  if (!hasRealtimeDatabaseConfig || !realtimeDb) {
+    return null
+  }
+
+  return ref(realtimeDb, `${CONNECTIONS_PATH}/${getSessionId()}`)
 }

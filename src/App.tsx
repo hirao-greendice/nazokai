@@ -1,11 +1,12 @@
-import { useEffect, useEffectEvent, useState } from 'react'
+import { useEffect, useState } from 'react'
 
 import './App.css'
+import { hasRealtimeDatabaseConfig, realtimeDatabaseConfigHint } from './lib/firebase'
 import {
-  PRESENCE_HEARTBEAT_MS,
-  clearSelection,
+  bindSelectionPresence,
+  clearSelectionPresence,
   getDeviceId,
-  publishSelection,
+  getSessionId,
   readStoredSelection,
   storeSelection,
   subscribeToOccupiedTeams,
@@ -18,15 +19,44 @@ const controlButtons: Array<{ label: string; role: ControlRole }> = [
   { label: 'STAFF', role: 'staff' },
   { label: 'MASTER', role: 'master' },
 ]
+
 const playerButtons = Array.from({ length: 12 }, (_, index) => index + 1)
+
+function StatusBanner({
+  isRealtimeConnected,
+  presenceError,
+}: {
+  isRealtimeConnected: boolean
+  presenceError: string | null
+}) {
+  const statusText = hasRealtimeDatabaseConfig
+    ? isRealtimeConnected
+      ? 'RTDB connected'
+      : 'RTDB connecting'
+    : 'RTDB not configured'
+
+  return (
+    <div className="status-banner" aria-live="polite">
+      <p>{statusText}</p>
+      {presenceError ? <p className="status-error">{presenceError}</p> : null}
+      {!hasRealtimeDatabaseConfig ? (
+        <p className="status-error">{realtimeDatabaseConfigHint}</p>
+      ) : null}
+    </div>
+  )
+}
 
 function PlayerScreen({
   teamNumber,
   occupiedTeams,
+  isRealtimeConnected,
+  presenceError,
   onBack,
 }: {
   teamNumber: number
   occupiedTeams: Set<number>
+  isRealtimeConnected: boolean
+  presenceError: string | null
   onBack: () => void
 }) {
   const occupiedTeamList = Array.from(occupiedTeams).sort((left, right) => left - right)
@@ -34,33 +64,43 @@ function PlayerScreen({
   return (
     <main className="player-screen">
       <section className="player-card">
+        <StatusBanner
+          isRealtimeConnected={isRealtimeConnected}
+          presenceError={presenceError}
+        />
         <p className="player-screen-label">PLAYER</p>
         <h1>TEAM {teamNumber}</h1>
         <p className="player-screen-message">
-          プレイヤー画面の仮表示です。Firebase への接続確認用に表示しています。
+          This is a temporary player screen for connection testing.
         </p>
 
         <div className="player-status-list" aria-label="connection status">
           <p>
-            接続状態:
-            <strong> 送信中 </strong>
+            Connection:
+            <strong>{isRealtimeConnected ? ' online' : ' offline'}</strong>
           </p>
           <p>
-            端末ID:
+            Device ID:
             <strong> {getDeviceId()}</strong>
           </p>
           <p>
-            使用中チーム:
-            <strong>{occupiedTeamList.length > 0 ? ` ${occupiedTeamList.join(', ')}` : ' なし'}</strong>
+            Session ID:
+            <strong> {getSessionId()}</strong>
+          </p>
+          <p>
+            Occupied teams:
+            <strong>
+              {occupiedTeamList.length > 0 ? ` ${occupiedTeamList.join(', ')}` : ' none'}
+            </strong>
           </p>
         </div>
 
         <p className="player-screen-hint">
-          別タブで最初の画面を開いて、このチーム番号が黄色になれば通信できています。
+          Open another tab and this team should stay highlighted while this tab is connected.
         </p>
 
         <button type="button" className="back-button" onClick={onBack}>
-          トップに戻る
+          Back to top
         </button>
       </section>
     </main>
@@ -76,45 +116,23 @@ function App() {
     return readStoredSelection()
   })
   const [occupiedTeams, setOccupiedTeams] = useState<Set<number>>(new Set())
-
-  const syncSelection = useEffectEvent((nextSelection: Selection | null) => {
-    if (!nextSelection) {
-      void clearSelection()
-      return
-    }
-
-    void publishSelection(nextSelection)
-  })
+  const [isRealtimeConnected, setIsRealtimeConnected] = useState(false)
+  const [presenceError, setPresenceError] = useState<string | null>(null)
 
   useEffect(() => {
-    const unsubscribe = subscribeToOccupiedTeams(setOccupiedTeams)
+    const unsubscribe = subscribeToOccupiedTeams(setOccupiedTeams, setPresenceError)
     return unsubscribe
   }, [])
 
   useEffect(() => {
     storeSelection(selection)
-    syncSelection(selection)
 
-    if (!selection) {
-      return
-    }
+    const cleanup = bindSelectionPresence(selection, {
+      onConnectionChange: setIsRealtimeConnected,
+      onError: setPresenceError,
+    })
 
-    const timerId = window.setInterval(() => {
-      syncSelection(selection)
-    }, PRESENCE_HEARTBEAT_MS)
-
-    const handleVisibilityChange = () => {
-      if (document.visibilityState === 'visible') {
-        syncSelection(selection)
-      }
-    }
-
-    document.addEventListener('visibilitychange', handleVisibilityChange)
-
-    return () => {
-      window.clearInterval(timerId)
-      document.removeEventListener('visibilitychange', handleVisibilityChange)
-    }
+    return cleanup
   }, [selection])
 
   const handlePlayerClick = (teamNumber: number) => {
@@ -131,18 +149,37 @@ function App() {
     })
   }
 
+  const handleBackToTop = () => {
+    setSelection(null)
+    void clearSelectionPresence().catch((error: unknown) => {
+      if (error instanceof Error) {
+        setPresenceError(error.message)
+        return
+      }
+
+      setPresenceError('Failed to clear presence.')
+    })
+  }
+
   if (selection?.role === 'player') {
     return (
       <PlayerScreen
         teamNumber={selection.teamNumber}
         occupiedTeams={occupiedTeams}
-        onBack={() => setSelection(null)}
+        isRealtimeConnected={isRealtimeConnected}
+        presenceError={presenceError}
+        onBack={handleBackToTop}
       />
     )
   }
 
   return (
     <main className="start-screen">
+      <StatusBanner
+        isRealtimeConnected={isRealtimeConnected}
+        presenceError={presenceError}
+      />
+
       <section className="player-area" aria-label="player selection">
         <div className="player-grid">
           {playerButtons.map((playerNumber) => (
